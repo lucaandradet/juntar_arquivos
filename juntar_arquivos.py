@@ -287,10 +287,21 @@ def escolher_extensao(root, contagem: Counter):
     return resultado["ext"]
 
 
+def fmt_tempo(segundos: float) -> str:
+    """Formata uma duração: 45 s / 2 min 05 s / 1 h 03 min."""
+    s = int(round(segundos))
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min {s % 60:02d} s"
+    return f"{s // 3600} h {(s % 3600) // 60:02d} min"
+
+
 def juntar_com_progresso(root, pasta: Path, extensao: str, qtd_arquivos: int):
     """Executa a junção em segundo plano mostrando uma janela de progresso.
 
-    Devolve o mesmo que juntar() ou levanta a exceção que ocorreu.
+    Devolve (resultado de juntar(), duração em segundos) ou levanta a
+    exceção que ocorreu.
     """
     janela = tk.Toplevel(root)
     janela.title("Juntando arquivos")
@@ -315,6 +326,11 @@ def juntar_com_progresso(root, pasta: Path, extensao: str, qtd_arquivos: int):
     ttk.Label(quadro, textvariable=txt_pct,
               font=("Segoe UI", 11, "bold")).pack()
 
+    txt_decorrido = tk.StringVar(value="Tempo decorrido: 0 s")
+    txt_restante = tk.StringVar(value="Tempo restante: calculando...")
+    ttk.Label(quadro, textvariable=txt_decorrido).pack(anchor="w", pady=(12, 0))
+    ttk.Label(quadro, textvariable=txt_restante).pack(anchor="w")
+
     centralizar(janela)
     janela.grab_set()
 
@@ -324,10 +340,10 @@ def juntar_com_progresso(root, pasta: Path, extensao: str, qtd_arquivos: int):
     def progresso(atual, total, nome, fracao):
         # Chamado pela thread de trabalho: só envia quando algo mudou,
         # para não sobrecarregar a interface.
-        pct = int(fracao * 100)
+        pct = int(fracao * 1000)    # resolução de 0,1% para a estimativa
         if pct != ultimo["pct"] or nome != ultimo["arq"]:
             ultimo["pct"], ultimo["arq"] = pct, nome
-            fila.put(("progresso", atual, total, nome, pct))
+            fila.put(("progresso", atual, total, nome, fracao))
 
     def trabalhar():
         try:
@@ -336,17 +352,45 @@ def juntar_com_progresso(root, pasta: Path, extensao: str, qtd_arquivos: int):
             fila.put(("erro", e))
 
     resultado = {}
+    estado = {"fracao": 0.0, "ultima_estimativa": 0.0}
+    inicio = time.time()
+
+    def atualizar_tempo():
+        """Atualiza o tempo decorrido e a estimativa de término.
+
+        A estimativa usa a velocidade média desde o início:
+        restante = decorrido x (parte que falta / parte já feita).
+        """
+        agora = time.time()
+        decorrido = agora - inicio
+        txt_decorrido.set(f"Tempo decorrido: {fmt_tempo(decorrido)}")
+
+        # recalcula a cada meio segundo para o número não ficar "pulando"
+        if agora - estado["ultima_estimativa"] < 0.5:
+            return
+        estado["ultima_estimativa"] = agora
+
+        f = estado["fracao"]
+        if f < 0.01 or decorrido < 2:
+            txt_restante.set("Tempo restante: calculando...")
+            return
+        restante = decorrido * (1 - f) / f
+        termino = time.strftime("%H:%M:%S", time.localtime(agora + restante))
+        txt_restante.set(f"Tempo restante: ~{fmt_tempo(restante)}  "
+                         f"(término previsto às {termino})")
 
     def atualizar_tela():
         try:
             while True:
                 msg = fila.get_nowait()
                 if msg[0] == "progresso":
-                    _, atual, total, nome, pct = msg
+                    _, atual, total, nome, fracao = msg
                     if nome and atual:
                         txt_arquivo.set(f"Arquivo {fmt(atual)} de {fmt(total)}: {nome}")
                     elif nome:
                         txt_arquivo.set(nome)
+                    estado["fracao"] = fracao
+                    pct = int(fracao * 100)
                     barra["value"] = pct
                     txt_pct.set(f"{pct}%")
                 else:
@@ -355,15 +399,17 @@ def juntar_com_progresso(root, pasta: Path, extensao: str, qtd_arquivos: int):
                     return
         except queue.Empty:
             pass
+        atualizar_tempo()
         janela.after(50, atualizar_tela)
 
     threading.Thread(target=trabalhar, daemon=True).start()
     atualizar_tela()
     root.wait_window(janela)
+    duracao = time.time() - inicio
 
     if "erro" in resultado:
         raise resultado["erro"]
-    return resultado["fim"]
+    return resultado["fim"], duracao
 
 
 def processar_pasta(root, pasta: Path):
@@ -382,8 +428,8 @@ def processar_pasta(root, pasta: Path):
             return
 
     try:
-        saida, qtd, total, log = juntar_com_progresso(root, pasta, extensao,
-                                                      contagem[extensao])
+        (saida, qtd, total, log), duracao = juntar_com_progresso(
+            root, pasta, extensao, contagem[extensao])
     except ImportError:
         messagebox.showerror("Dependência ausente",
                              "Para juntar arquivos Excel instale:\n\n"
@@ -395,7 +441,8 @@ def processar_pasta(root, pasta: Path):
 
     avisos = [l for l in log if l.startswith("[AVISO]") or l.startswith("[vazio]")]
     msg = (f"{fmt(qtd)} arquivo(s) {extensao} juntado(s).\n"
-           f"{fmt(total)} linhas de dados + 1 cabeçalho.\n\n"
+           f"{fmt(total)} linhas de dados + 1 cabeçalho.\n"
+           f"Tempo total: {fmt_tempo(duracao)}\n\n"
            f"Arquivo gerado:\n{saida}")
     if avisos:
         msg += "\n\nAtenção:\n" + "\n".join(avisos)
